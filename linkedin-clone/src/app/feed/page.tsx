@@ -82,6 +82,7 @@ type MessageContact = {
   color: string;
   subtitle: string;
   imageUrl?: string;
+  unread?: boolean;
 };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -620,18 +621,16 @@ export default function Home() {
         { event: "UPDATE", schema: "public", table: "posts" },
         async (payload) => {
           const updated = payload.new as DbPost;
-          const { data: profile } = await supabase
-            .from("profiles")
-            .select("*")
-            .eq("username", updated.author_username)
-            .maybeSingle();
-          const mapped = dbPostToPost(updated, profile as Profile | null);
           setPosts((prev) =>
-            prev.map((p) =>
-              p.id === mapped.id
-                ? { ...mapped, likes: p.likes, comments: p.comments, likedByUser: p.likedByUser }
-                : p,
-            ),
+            prev.map((p) => {
+              if (p.id !== updated.id) return p;
+              return {
+                ...p,
+                content: updated.content,
+                mediaUrl: updated.media_url,
+                mediaType: updated.media_type ?? "none",
+              };
+            })
           );
         },
       )
@@ -645,18 +644,62 @@ export default function Home() {
       )
       .subscribe();
 
-    const messagesChannel = supabase
+      const messagesChannel = supabase
       .channel("restock-messages-realtime")
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "messages" },
-        (payload) => {
+        async (payload) => {
           const msg = payload.new as DbMessage;
-          if (!isMessageRelevant(msg, user.username, selectedContact)) return;
-          setDmMessages((prev) => {
-            if (prev.some((m) => m.id === msg.id)) return prev;
-            return [...prev, msg];
-          });
+          
+          // 1. If it's relevant to the current conversation, update the chat window
+          if (isMessageRelevant(msg, user.username, selectedContact)) {
+            setDmMessages((prev) => {
+              if (prev.some((m) => m.id === msg.id)) return prev;
+              return [...prev, msg];
+            });
+          }
+          
+          // 2. If someone else sent you a message, flip their unread badge to true
+          if (msg.receiver_username === user.username && msg.sender_username !== selectedContact) {
+            // Check if we need to fetch their profile details first
+            if (!discoveredContacts[msg.sender_username] && !MESSAGE_CONTACTS.some(m => m.username === msg.sender_username)) {
+              const { data: senderProfile } = await supabase
+                .from("profiles")
+                .select("*")
+                .eq("username", msg.sender_username)
+                .maybeSingle();
+
+              if (senderProfile) {
+                setDiscoveredContacts((prev) => ({
+                  ...prev,
+                  [msg.sender_username]: {
+                    username: senderProfile.username,
+                    name: senderProfile.display_name,
+                    initials: getInitials(senderProfile.display_name),
+                    color: isImageSource(senderProfile.pfp_color) ? PFP_COLORS[0] : senderProfile.pfp_color,
+                    subtitle: senderProfile.headline,
+                    imageUrl: isImageSource(senderProfile.pfp_color) ? senderProfile.pfp_color : undefined,
+                    unread: true,
+                  },
+                }));
+                return;
+              }
+            }
+
+            // If they are already discovered or are a default contact, just flip the unread boolean
+            setDiscoveredContacts((prev) => {
+              const currentContact = prev[msg.sender_username] || allMessageContacts.find(m => m.username === msg.sender_username);
+              if (!currentContact) return prev;
+              return {
+                ...prev,
+                [msg.sender_username]: {
+                  ...currentContact,
+                  unread: true,
+                },
+              };
+            });
+          }
         },
       )
       .subscribe();
@@ -964,7 +1007,11 @@ export default function Home() {
       .select()
       .single();
 
-    if (newPost) await appendPostFromDb(newPost as DbPost);
+    if (newPost) {
+      // Enriched locally with your user state for instant feedback on the feed
+      const mappedPost = dbPostToPost(newPost as DbPost, user);
+      setPosts((prev) => [mappedPost, ...prev]);
+    }
 
     closePostModal();
     setPostSubmitting(false);
@@ -1004,7 +1051,12 @@ export default function Home() {
     setPosts((prev) => prev.filter((p) => p.id !== postId));
     setOpenMenuPostId(null);
   }
-
+  function handleSharePost(post: Post) {
+    if (!user) return;
+    const sharePayload = `📢 Shared a post by @${post.authorUsername}:\n\n"${post.content}"${post.mediaUrl ? `\n\nAttachment: ${post.mediaUrl}` : ""}`;
+    setDmDraft(sharePayload);
+    setActiveTab("messaging");
+  }
   const filteredPosts = searchQuery.trim()
     ? posts.filter((p) =>
         p.content.toLowerCase().includes(searchQuery.trim().toLowerCase()),
@@ -1304,7 +1356,7 @@ export default function Home() {
                 <div className="flex border-t border-gray-200 px-2 py-1">
                   <PostAction icon={() => <LikeIcon filled={post.likedByUser} />} label="Like" active={post.likedByUser} onClick={() => handleToggleLike(post.id)} />
                   <PostAction icon={CommentIcon} label="Comment" />
-                  <PostAction icon={ShareIcon} label="Share" />
+                  <PostAction icon={ShareIcon} label="Share" onClick={() => handleSharePost(post)} />
                 </div>
               </article>
             );
@@ -1361,15 +1413,35 @@ export default function Home() {
         return (
           <TabContent tabKey="messaging">
             <div className={`flex h-[520px] overflow-hidden rounded-lg border border-gray-200 bg-white ${CARD_HOVER}`}>
-              <div className="w-1/3 min-w-[140px] border-r border-gray-200">
+            <div className="w-1/3 min-w-[140px] border-r border-gray-200">
                 <div className="border-b border-gray-200 px-4 py-3 text-sm font-semibold text-gray-900">Messaging</div>
                 {allMessageContacts.map((c) => (
-                  <button key={c.username} type="button" onClick={() => setSelectedContact(c.username)} className={`flex w-full items-center gap-3 px-4 py-3 text-left ${BTN_TRANSITION} ${selectedContact === c.username ? "bg-sky-50" : "hover:bg-gray-50"}`}>
-                    <Avatar initials={c.initials} color={c.color} imageUrl={c.imageUrl} size="sm" />
-                    <div className="min-w-0">
-                      <p className="truncate text-sm font-semibold text-gray-900">{c.name}</p>
-                      <p className="truncate text-xs text-gray-500">{c.subtitle}</p>
+                  <button 
+                    key={c.username} 
+                    type="button" 
+                    onClick={() => {
+                      setSelectedContact(c.username);
+                      // Safely clear out unread indicator when clicked
+                      if (discoveredContacts[c.username]?.unread) {
+                        setDiscoveredContacts((prev) => ({
+                          ...prev,
+                          [c.username]: { ...prev[c.username], unread: false },
+                        }));
+                      }
+                    }} 
+                    className={`flex w-full items-center justify-between px-4 py-3 text-left ${BTN_TRANSITION} ${selectedContact === c.username ? "bg-sky-50" : "hover:bg-gray-50"}`}
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <Avatar initials={c.initials} color={c.color} imageUrl={c.imageUrl} size="sm" />
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-gray-900">{c.name}</p>
+                        <p className="truncate text-xs text-gray-500">{c.subtitle}</p>
+                      </div>
                     </div>
+                    {/* Visual status notification dot */}
+                    {discoveredContacts[c.username]?.unread && (
+                      <span className="h-2 w-2 shrink-0 rounded-full bg-sky-600 block ml-2" />
+                    )}
                   </button>
                 ))}
               </div>
