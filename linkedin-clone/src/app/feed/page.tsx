@@ -31,8 +31,18 @@ type Profile = {
   password?: string;
 };
 
+type DbPost = {
+  id: string;
+  author_username: string;
+  content: string;
+  media_url: string | null;
+  media_type: "image" | "file" | "none" | null;
+  created_at: string;
+};
+
 type Post = {
   id: string;
+  authorUsername: string;
   author: string;
   initials: string;
   avatarColor: string;
@@ -40,6 +50,8 @@ type Post = {
   headline: string;
   time: string;
   content: string;
+  mediaUrl?: string | null;
+  mediaType?: "image" | "file" | "none";
   likes: number;
   comments: number;
   likedByUser: boolean;
@@ -62,6 +74,15 @@ type RecommendedPerson = {
 };
 
 type ChatMessage = { role: "user" | "assistant"; text: string };
+
+type MessageContact = {
+  username: string;
+  name: string;
+  initials: string;
+  color: string;
+  subtitle: string;
+  imageUrl?: string;
+};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -103,7 +124,7 @@ const BANNER_COLORS = [
   "from-indigo-600 to-blue-500",
 ];
 
-const MESSAGE_CONTACTS = [
+const MESSAGE_CONTACTS: MessageContact[] = [
   {
     username: "sarah_chen",
     name: "Sarah Chen",
@@ -124,48 +145,6 @@ const MESSAGE_CONTACTS = [
     initials: "AI",
     color: "bg-sky-700",
     subtitle: "Always online",
-  },
-];
-
-const INITIAL_POSTS: Post[] = [
-  {
-    id: "1",
-    author: "Sarah Chen",
-    initials: "SC",
-    avatarColor: "bg-violet-600",
-    headline: "VP of Operations · Meridian Supply Co.",
-    time: "2h",
-    content:
-      "Excited to share that our team reduced warehouse turnaround time by 18% this quarter. Small process changes — clearer pick paths, better shift handoffs — added up fast.",
-    likes: 142,
-    comments: 23,
-    likedByUser: false,
-  },
-  {
-    id: "2",
-    author: "Marcus Rivera",
-    initials: "MR",
-    avatarColor: "bg-emerald-600",
-    headline: "Procurement Lead · Northline Retail Group",
-    time: "5h",
-    content:
-      "Three things I look for when evaluating a new supplier partnership: consistent lead times, transparent pricing, and a team that communicates before problems become crises.",
-    likes: 89,
-    comments: 17,
-    likedByUser: false,
-  },
-  {
-    id: "3",
-    author: "Elena Okonkwo",
-    initials: "EO",
-    avatarColor: "bg-amber-600",
-    headline: "Director of Inventory · Harbor & Co.",
-    time: "1d",
-    content:
-      "Just wrapped a cross-functional planning session on seasonal demand. The best insight came from pairing sales forecasts with real-time stock levels.",
-    likes: 214,
-    comments: 41,
-    likedByUser: false,
   },
 ];
 
@@ -215,6 +194,52 @@ function isImageSource(value: string) {
 
 function resolveIndustry(industry: string, customIndustry: string) {
   return industry === INDUSTRY_OTHER ? customIndustry.trim() : industry;
+}
+
+function formatPostTime(createdAt: string) {
+  const diff = Date.now() - new Date(createdAt).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d`;
+  return new Date(createdAt).toLocaleDateString();
+}
+
+function dbPostToPost(db: DbPost, profile?: Profile | null): Post {
+  const displayName = profile?.display_name || db.author_username;
+  const pfp = profile?.pfp_color || PFP_COLORS[0];
+  return {
+    id: db.id,
+    authorUsername: db.author_username,
+    author: displayName,
+    initials: getInitials(displayName),
+    avatarColor: isImageSource(pfp) ? PFP_COLORS[0] : pfp,
+    avatarImageUrl: isImageSource(pfp) ? pfp : undefined,
+    headline: profile?.headline || "",
+    time: formatPostTime(db.created_at),
+    content: db.content,
+    mediaUrl: db.media_url,
+    mediaType: db.media_type ?? "none",
+    likes: 0,
+    comments: 0,
+    likedByUser: false,
+  };
+}
+
+function isMessageRelevant(
+  msg: DbMessage,
+  currentUsername: string,
+  contactUsername: string,
+) {
+  return (
+    (msg.sender_username === currentUsername &&
+      msg.receiver_username === contactUsername) ||
+    (msg.sender_username === contactUsername &&
+      msg.receiver_username === currentUsername)
+  );
 }
 
 function buildHeadline(
@@ -436,7 +461,13 @@ export default function Home() {
   const [modalMode, setModalMode] = useState<ModalMode>("create");
   const [editingPostId, setEditingPostId] = useState<string | null>(null);
   const [postDraft, setPostDraft] = useState("");
-  const [posts, setPosts] = useState<Post[]>(INITIAL_POSTS);
+  const [postAttachment, setPostAttachment] = useState<File | null>(null);
+  const [postSubmitting, setPostSubmitting] = useState(false);
+  const [posts, setPosts] = useState<Post[]>([]);
+  const [postsLoading, setPostsLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchProfiles, setSearchProfiles] = useState<Profile[]>([]);
+  const [showSearchDropdown, setShowSearchDropdown] = useState(false);
   const [connectedIds, setConnectedIds] = useState<Set<string>>(new Set());
   const [appliedJobIds, setAppliedJobIds] = useState<Set<string>>(new Set());
   const [openMenuPostId, setOpenMenuPostId] = useState<string | null>(null);
@@ -444,6 +475,9 @@ export default function Home() {
   const [profileDraft, setProfileDraft] = useState({ display_name: "", headline: "", pfp_color: "", banner_color: "", occupation_type: "Job" as OccupationType });
 
   const [selectedContact, setSelectedContact] = useState(MESSAGE_CONTACTS[0].username);
+  const [discoveredContacts, setDiscoveredContacts] = useState<
+    Record<string, MessageContact>
+  >({});
   const [dmMessages, setDmMessages] = useState<DbMessage[]>([]);
   const [dmDraft, setDmDraft] = useState("");
   const [dmSending, setDmSending] = useState(false);
@@ -459,6 +493,8 @@ export default function Home() {
   const menuRef = useRef<HTMLDivElement>(null);
   const pfpFileRef = useRef<HTMLInputElement>(null);
   const bannerFileRef = useRef<HTMLInputElement>(null);
+  const postFileRef = useRef<HTMLInputElement>(null);
+  const searchRef = useRef<HTMLDivElement>(null);
 
   const resolvedIndustry = resolveIndustry(industry, customIndustry);
   const recommendations = generateRecommendations(
@@ -513,12 +549,152 @@ export default function Home() {
     if (data) setDmMessages(data as DbMessage[]);
   }, [user, selectedContact]);
 
+  const enrichAndSetPosts = useCallback(async (dbPosts: DbPost[]) => {
+    const usernames = [...new Set(dbPosts.map((p) => p.author_username))];
+    let profileMap = new Map<string, Profile>();
+
+    if (usernames.length > 0) {
+      const { data: profiles } = await supabase
+        .from("profiles")
+        .select("*")
+        .in("username", usernames);
+      profileMap = new Map(
+        (profiles || []).map((p) => [p.username, p as Profile]),
+      );
+    }
+
+    setPosts(dbPosts.map((db) => dbPostToPost(db, profileMap.get(db.author_username))));
+  }, []);
+
+  const fetchPosts = useCallback(async () => {
+    setPostsLoading(true);
+    const { data } = await supabase
+      .from("posts")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (data) await enrichAndSetPosts(data as DbPost[]);
+    setPostsLoading(false);
+  }, [enrichAndSetPosts]);
+
+  const appendPostFromDb = useCallback(
+    async (dbPost: DbPost) => {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("username", dbPost.author_username)
+        .maybeSingle();
+
+      const mapped = dbPostToPost(dbPost, profile as Profile | null);
+      setPosts((prev) => {
+        if (prev.some((p) => p.id === mapped.id)) return prev;
+        return [mapped, ...prev];
+      });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!user) return;
+    fetchPosts();
+  }, [user, fetchPosts]);
+
   useEffect(() => {
     if (!user || activeTab !== "messaging") return;
     fetchDmMessages();
-    const interval = setInterval(fetchDmMessages, 2500);
-    return () => clearInterval(interval);
   }, [user, activeTab, selectedContact, fetchDmMessages]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const postsChannel = supabase
+      .channel("restock-posts-realtime")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "posts" },
+        (payload) => {
+          appendPostFromDb(payload.new as DbPost);
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "posts" },
+        async (payload) => {
+          const updated = payload.new as DbPost;
+          const { data: profile } = await supabase
+            .from("profiles")
+            .select("*")
+            .eq("username", updated.author_username)
+            .maybeSingle();
+          const mapped = dbPostToPost(updated, profile as Profile | null);
+          setPosts((prev) =>
+            prev.map((p) =>
+              p.id === mapped.id
+                ? { ...mapped, likes: p.likes, comments: p.comments, likedByUser: p.likedByUser }
+                : p,
+            ),
+          );
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "posts" },
+        (payload) => {
+          const deleted = payload.old as { id: string };
+          setPosts((prev) => prev.filter((p) => p.id !== deleted.id));
+        },
+      )
+      .subscribe();
+
+    const messagesChannel = supabase
+      .channel("restock-messages-realtime")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "messages" },
+        (payload) => {
+          const msg = payload.new as DbMessage;
+          if (!isMessageRelevant(msg, user.username, selectedContact)) return;
+          setDmMessages((prev) => {
+            if (prev.some((m) => m.id === msg.id)) return prev;
+            return [...prev, msg];
+          });
+        },
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(postsChannel);
+      supabase.removeChannel(messagesChannel);
+    };
+  }, [user, selectedContact, appendPostFromDb]);
+
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) {
+      setSearchProfiles([]);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      const { data } = await supabase
+        .from("profiles")
+        .select("id, username, display_name, headline, pfp_color, banner_color, occupation_type")
+        .or(`username.ilike.%${q}%,display_name.ilike.%${q}%`)
+        .limit(8);
+      setSearchProfiles((data as Profile[]) || []);
+    }, 250);
+
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (searchRef.current && !searchRef.current.contains(event.target as Node)) {
+        setShowSearchDropdown(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   useEffect(() => {
     dmEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -670,7 +846,6 @@ export default function Home() {
         message_text: getChatbotResponse(text, user.display_name, user.headline),
       });
     }
-    await fetchDmMessages();
     setDmSending(false);
   }
 
@@ -716,7 +891,16 @@ export default function Home() {
     setModalMode("create");
     setEditingPostId(null);
     setPostDraft("");
+    setPostAttachment(null);
     setIsPostModalOpen(true);
+  }
+
+  function closePostModal() {
+    setIsPostModalOpen(false);
+    setPostDraft("");
+    setPostAttachment(null);
+    setEditingPostId(null);
+    setModalMode("create");
   }
 
   function openEditModal(post: Post) {
@@ -727,37 +911,105 @@ export default function Home() {
     setIsPostModalOpen(true);
   }
 
-  function handleSavePost() {
-    if (!user) return;
+  async function handleSavePost() {
+    if (!user || postSubmitting) return;
     const trimmed = postDraft.trim();
     if (!trimmed) return;
+
+    setPostSubmitting(true);
+
     if (modalMode === "edit" && editingPostId) {
-      setPosts((prev) => prev.map((p) => (p.id === editingPostId ? { ...p, content: trimmed } : p)));
-    } else {
-      setPosts((prev) => [{
-        id: `user-${Date.now()}`,
-        author: user.display_name,
-        initials: getInitials(user.display_name),
-        avatarColor: isImageSource(user.pfp_color) ? PFP_COLORS[0] : user.pfp_color,
-        avatarImageUrl: isImageSource(user.pfp_color) ? user.pfp_color : undefined,
-        headline: user.headline,
-        time: "Just now",
-        content: trimmed,
-        likes: 0,
-        comments: 0,
-        likedByUser: false,
-      }, ...prev]);
+      await supabase
+        .from("posts")
+        .update({ content: trimmed })
+        .eq("id", editingPostId)
+        .eq("author_username", user.username);
+      setPosts((prev) =>
+        prev.map((p) => (p.id === editingPostId ? { ...p, content: trimmed } : p)),
+      );
+      closePostModal();
+      setPostSubmitting(false);
+      return;
     }
-    setIsPostModalOpen(false);
-    setPostDraft("");
-    setEditingPostId(null);
-    setModalMode("create");
+
+    let mediaUrl: string | null = null;
+    let mediaType: "image" | "file" | "none" = "none";
+
+    if (postAttachment) {
+      const ext = postAttachment.name.split(".").pop() || "file";
+      const path = `${user.username}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+      const { error: uploadError } = await supabase.storage
+        .from("post-attachments")
+        .upload(path, postAttachment, { upsert: false });
+
+      if (!uploadError) {
+        const { data: urlData } = supabase.storage
+          .from("post-attachments")
+          .getPublicUrl(path);
+        mediaUrl = urlData.publicUrl;
+        mediaType = postAttachment.type.startsWith("image/")
+          ? "image"
+          : "file";
+      }
+    }
+
+    const { data: newPost } = await supabase
+      .from("posts")
+      .insert({
+        author_username: user.username,
+        content: trimmed,
+        media_url: mediaUrl,
+        media_type: mediaType,
+      })
+      .select()
+      .single();
+
+    if (newPost) await appendPostFromDb(newPost as DbPost);
+
+    closePostModal();
+    setPostSubmitting(false);
   }
 
-  function handleDeletePost(postId: string) {
+  function selectProfileContact(profile: Profile) {
+    setDiscoveredContacts((prev) => ({
+      ...prev,
+      [profile.username]: {
+        username: profile.username,
+        name: profile.display_name,
+        initials: getInitials(profile.display_name),
+        color: isImageSource(profile.pfp_color) ? PFP_COLORS[0] : profile.pfp_color,
+        subtitle: profile.headline,
+        imageUrl: isImageSource(profile.pfp_color) ? profile.pfp_color : undefined,
+      },
+    }));
+    setSelectedContact(profile.username);
+    setActiveTab("messaging");
+    setShowSearchDropdown(false);
+  }
+
+  const allMessageContacts = [
+    ...MESSAGE_CONTACTS,
+    ...Object.values(discoveredContacts).filter(
+      (c) => !MESSAGE_CONTACTS.some((m) => m.username === c.username),
+    ),
+  ];
+
+  async function handleDeletePost(postId: string) {
+    if (!user) return;
+    await supabase
+      .from("posts")
+      .delete()
+      .eq("id", postId)
+      .eq("author_username", user.username);
     setPosts((prev) => prev.filter((p) => p.id !== postId));
     setOpenMenuPostId(null);
   }
+
+  const filteredPosts = searchQuery.trim()
+    ? posts.filter((p) =>
+        p.content.toLowerCase().includes(searchQuery.trim().toLowerCase()),
+      )
+    : posts;
 
   function validateSignupStep(step: number) {
     setAuthError("");
@@ -987,8 +1239,16 @@ export default function Home() {
                 <span className="flex-1 rounded-full border border-gray-300 bg-gray-50 px-4 py-2.5 text-sm text-gray-500 hover:border-gray-400 hover:bg-gray-100">Start a post</span>
               </button>
             </div>
-            {posts.map((post) => {
-              const isOwnPost = post.author === user.display_name;
+            {postsLoading && (
+              <p className="py-8 text-center text-sm text-gray-500">Loading posts...</p>
+            )}
+            {!postsLoading && filteredPosts.length === 0 && (
+              <p className="rounded-lg border border-gray-200 bg-white py-12 text-center text-sm text-gray-500">
+                {searchQuery.trim() ? "No posts match your search." : "No posts yet. Start the conversation!"}
+              </p>
+            )}
+            {filteredPosts.map((post) => {
+              const isOwnPost = post.authorUsername === user.username;
               const postAvatarImage =
                 isOwnPost && isImageSource(user.pfp_color)
                   ? user.pfp_color
@@ -1006,7 +1266,7 @@ export default function Home() {
                     <p className="truncate text-xs text-gray-600">{post.headline}</p>
                     <p className="mt-0.5 text-xs text-gray-500">{post.time}</p>
                   </div>
-                  {post.author === user.display_name && (
+                  {isOwnPost && (
                     <div ref={openMenuPostId === post.id ? menuRef : undefined} className="absolute right-3 top-3">
                       <button type="button" onClick={() => setOpenMenuPostId((p) => (p === post.id ? null : post.id))} className={`rounded-full p-1.5 text-gray-500 ${BTN_TRANSITION} hover:bg-gray-100`} aria-label="Post options"><MoreIcon /></button>
                       {openMenuPostId === post.id && (
@@ -1018,7 +1278,26 @@ export default function Home() {
                     </div>
                   )}
                 </div>
-                <div className="px-4 pb-3"><p className="text-sm leading-relaxed text-gray-800">{post.content}</p></div>
+                <div className="px-4 pb-3">
+                  <p className="text-sm leading-relaxed text-gray-800">{post.content}</p>
+                  {post.mediaType === "image" && post.mediaUrl && (
+                    <img
+                      src={post.mediaUrl}
+                      alt="Post attachment"
+                      className="mt-3 max-h-80 w-full rounded-lg border border-gray-200 object-cover"
+                    />
+                  )}
+                  {post.mediaType === "file" && post.mediaUrl && (
+                    <a
+                      href={post.mediaUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={`mt-3 inline-flex items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-4 py-2 text-sm font-semibold text-sky-700 ${BTN_TRANSITION} hover:bg-sky-50`}
+                    >
+                      View attached document
+                    </a>
+                  )}
+                </div>
                 <div className="flex items-center justify-between border-t border-gray-100 px-4 py-2 text-xs text-gray-500">
                   <span>{post.likes} likes</span><span>{post.comments} comments</span>
                 </div>
@@ -1078,15 +1357,15 @@ export default function Home() {
         );
 
       case "messaging": {
-        const contact = MESSAGE_CONTACTS.find((c) => c.username === selectedContact)!;
+        const contact = allMessageContacts.find((c) => c.username === selectedContact) ?? allMessageContacts[0];
         return (
           <TabContent tabKey="messaging">
             <div className={`flex h-[520px] overflow-hidden rounded-lg border border-gray-200 bg-white ${CARD_HOVER}`}>
               <div className="w-1/3 min-w-[140px] border-r border-gray-200">
                 <div className="border-b border-gray-200 px-4 py-3 text-sm font-semibold text-gray-900">Messaging</div>
-                {MESSAGE_CONTACTS.map((c) => (
+                {allMessageContacts.map((c) => (
                   <button key={c.username} type="button" onClick={() => setSelectedContact(c.username)} className={`flex w-full items-center gap-3 px-4 py-3 text-left ${BTN_TRANSITION} ${selectedContact === c.username ? "bg-sky-50" : "hover:bg-gray-50"}`}>
-                    <Avatar initials={c.initials} color={c.color} size="sm" />
+                    <Avatar initials={c.initials} color={c.color} imageUrl={c.imageUrl} size="sm" />
                     <div className="min-w-0">
                       <p className="truncate text-sm font-semibold text-gray-900">{c.name}</p>
                       <p className="truncate text-xs text-gray-500">{c.subtitle}</p>
@@ -1096,7 +1375,7 @@ export default function Home() {
               </div>
               <div className="flex min-w-0 flex-1 flex-col">
                 <div className="flex items-center gap-3 border-b border-gray-200 px-4 py-3">
-                  <Avatar initials={contact.initials} color={contact.color} size="sm" />
+                  <Avatar initials={contact.initials} color={contact.color} imageUrl={contact.imageUrl} size="sm" />
                   <div>
                     <p className="text-sm font-semibold text-gray-900">{contact.name}</p>
                     <p className="text-xs text-gray-500">{contact.subtitle}</p>
@@ -1158,10 +1437,47 @@ export default function Home() {
       <header className="sticky top-0 z-50 border-b border-gray-200 bg-white">
         <div className="mx-auto flex h-14 max-w-[1128px] items-center gap-4 px-4 sm:gap-6 sm:px-6">
           <button type="button" onClick={() => setActiveTab("home")} className={`shrink-0 text-xl font-bold tracking-tight text-black sm:text-2xl ${BTN_TRANSITION} hover:opacity-80`}>Restock</button>
-          <div className="hidden min-w-0 flex-1 sm:block">
+          <div className="hidden min-w-0 flex-1 sm:block" ref={searchRef}>
             <div className="relative max-w-md">
               <div className="pointer-events-none absolute inset-y-0 left-3 flex items-center"><SearchIcon /></div>
-              <input type="search" placeholder="Search" className={`w-full rounded-md border border-gray-300 bg-gray-50 py-2 pl-10 pr-4 text-sm ${BTN_TRANSITION} focus:border-sky-600 focus:bg-white focus:outline-none focus:ring-1 focus:ring-sky-600`} />
+              <input
+                type="search"
+                placeholder="Search posts and people..."
+                value={searchQuery}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setShowSearchDropdown(true);
+                }}
+                onFocus={() => setShowSearchDropdown(true)}
+                className={`w-full rounded-md border border-gray-300 bg-gray-50 py-2 pl-10 pr-4 text-sm ${BTN_TRANSITION} focus:border-sky-600 focus:bg-white focus:outline-none focus:ring-1 focus:ring-sky-600`}
+              />
+              {showSearchDropdown && searchQuery.trim() && searchProfiles.length > 0 && (
+                <div className="restock-dropdown-enter absolute left-0 right-0 top-full z-50 mt-1 overflow-hidden rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
+                  <p className="px-4 py-2 text-xs font-semibold uppercase tracking-wide text-gray-500">People</p>
+                  {searchProfiles.map((profile) => (
+                    <button
+                      key={profile.username}
+                      type="button"
+                      onClick={() => {
+                        setSearchQuery(profile.display_name);
+                        selectProfileContact(profile);
+                      }}
+                      className={`flex w-full items-center gap-3 px-4 py-2.5 text-left ${BTN_TRANSITION} hover:bg-gray-50`}
+                    >
+                      <Avatar
+                        initials={getInitials(profile.display_name)}
+                        color={profile.pfp_color}
+                        imageUrl={isImageSource(profile.pfp_color) ? profile.pfp_color : undefined}
+                        size="sm"
+                      />
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-gray-900">{profile.display_name}</p>
+                        <p className="truncate text-xs text-gray-500">@{profile.username}</p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
           <nav className="ml-auto flex items-center gap-1 sm:gap-2">
@@ -1208,6 +1524,33 @@ export default function Home() {
         <section className="min-w-0 overflow-hidden">{renderCenterContent()}</section>
 
         <aside className="space-y-2">
+          {searchQuery.trim() && searchProfiles.length > 0 && (
+            <div className={`rounded-lg border border-gray-200 bg-white p-4 ${CARD_HOVER}`}>
+              <h2 className="text-sm font-semibold text-gray-900">People matching &ldquo;{searchQuery}&rdquo;</h2>
+              <ul className="mt-3 space-y-2">
+                {searchProfiles.map((profile) => (
+                  <li key={profile.username}>
+                    <button
+                      type="button"
+                      onClick={() => selectProfileContact(profile)}
+                      className={`flex w-full items-center gap-3 rounded-lg p-2 text-left ${BTN_TRANSITION} hover:bg-gray-50`}
+                    >
+                      <Avatar
+                        initials={getInitials(profile.display_name)}
+                        color={profile.pfp_color}
+                        imageUrl={isImageSource(profile.pfp_color) ? profile.pfp_color : undefined}
+                        size="sm"
+                      />
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-gray-900">{profile.display_name}</p>
+                        <p className="truncate text-xs text-gray-600">{profile.headline}</p>
+                      </div>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className={`rounded-lg border border-gray-200 bg-white p-4 ${CARD_HOVER}`}>
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-gray-900">Restock News &amp; Trends</h2>
@@ -1230,11 +1573,11 @@ export default function Home() {
 
       {/* Post Modal */}
       {isPostModalOpen && (
-        <div className="restock-backdrop-enter fixed inset-0 z-[100] flex items-start justify-center bg-black/50 px-4 pt-[10vh]" onClick={() => setIsPostModalOpen(false)} role="presentation">
+        <div className="restock-backdrop-enter fixed inset-0 z-[100] flex items-start justify-center bg-black/50 px-4 pt-[10vh]" onClick={closePostModal} role="presentation">
           <div className="restock-modal-enter w-full max-w-lg rounded-lg border border-gray-200 bg-white shadow-xl" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
             <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
               <h2 className="flex-1 text-center text-base font-semibold">{modalMode === "edit" ? "Edit post" : "Create a post"}</h2>
-              <button type="button" onClick={() => setIsPostModalOpen(false)} className={`rounded-full p-1.5 ${BTN_TRANSITION} hover:bg-gray-100`}><CloseIcon /></button>
+              <button type="button" onClick={closePostModal} className={`rounded-full p-1.5 ${BTN_TRANSITION} hover:bg-gray-100`}><CloseIcon /></button>
             </div>
             <div className="p-4">
               <div className="flex items-center gap-3">
@@ -1247,9 +1590,42 @@ export default function Home() {
                 <div><p className="text-sm font-semibold">{user.display_name}</p><p className="text-xs text-gray-600">{user.headline}</p></div>
               </div>
               <textarea value={postDraft} onChange={(e) => setPostDraft(e.target.value)} placeholder="What do you want to talk about?" rows={6} className="mt-4 w-full resize-none border-0 bg-transparent text-sm focus:outline-none" autoFocus />
+              {modalMode === "create" && (
+                <div className="mt-4">
+                  <input
+                    ref={postFileRef}
+                    type="file"
+                    accept="image/*,.pdf,.doc,.docx,.txt,.xls,.xlsx"
+                    className="hidden"
+                    onChange={(e) => setPostAttachment(e.target.files?.[0] ?? null)}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => postFileRef.current?.click()}
+                    className={`flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-gray-300 bg-gray-50 px-4 py-3 text-sm font-semibold text-gray-700 ${SMOOTH_TRANSITION} hover:border-sky-600 hover:bg-sky-50 hover:text-sky-700`}
+                  >
+                    <ShareIcon />
+                    {postAttachment ? postAttachment.name : "Attach image or document"}
+                  </button>
+                  {postAttachment && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPostAttachment(null);
+                        if (postFileRef.current) postFileRef.current.value = "";
+                      }}
+                      className={`mt-2 text-xs font-semibold text-red-600 ${BTN_TRANSITION} hover:text-red-700`}
+                    >
+                      Remove attachment
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
             <div className="flex justify-end border-t border-gray-200 px-4 py-3">
-              <button type="button" onClick={handleSavePost} disabled={!postDraft.trim()} className={`rounded-full bg-sky-600 px-6 py-2 text-sm font-semibold text-white ${BTN_TRANSITION} hover:bg-sky-700 disabled:opacity-50`}>{modalMode === "edit" ? "Save" : "Post"}</button>
+              <button type="button" onClick={handleSavePost} disabled={!postDraft.trim() || postSubmitting} className={`rounded-full bg-sky-600 px-6 py-2 text-sm font-semibold text-white ${BTN_TRANSITION} hover:bg-sky-700 disabled:opacity-50`}>
+                {postSubmitting ? "Posting..." : modalMode === "edit" ? "Save" : "Post"}
+              </button>
             </div>
           </div>
         </div>
